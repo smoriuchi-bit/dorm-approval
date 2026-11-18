@@ -25,6 +25,13 @@ function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.ad
 
 /* ---------- server ---------- */
 const S = { org: '', me: null, people: [], types: [], routes: [], requests: [], needsInstall: false, mailMode: '' };
+let busyN = 0, busyT = 0;
+function busyStart() {
+  if (busyN++ === 0) busyT = setTimeout(() => document.documentElement.classList.add('is-busy'), 200);
+}
+function busyEnd() {
+  if (--busyN <= 0) { busyN = 0; clearTimeout(busyT); document.documentElement.classList.remove('is-busy'); }
+}
 const SESSION_KEY = 'dorm-session';
 const getSession = () => { try { return localStorage.getItem(SESSION_KEY) || ''; } catch { return ''; } };
 const setSession = t => { try { if (t) localStorage.setItem(SESSION_KEY, t); else localStorage.removeItem(SESSION_KEY); } catch {} };
@@ -33,24 +40,45 @@ async function api(a, data) {
   const body = JSON.stringify(Object.assign({}, data || {}, { a, session: getSession() }));
   let res;
   // text/plain で送ると、Apps Script へ追加の確認なしで届きます
+  busyStart();
   try { res = await fetch(window.DORM_API, { method: 'POST', body, redirect: 'follow' }); }
-  catch { throw new Error('サーバーにつながりません。通信状況を確かめてください。'); }
+  catch { busyEnd(); throw new Error('サーバーにつながりません。通信状況を確かめてください。'); }
+  busyEnd();
   let j = null;
   try { j = await res.json(); } catch {}
   if (!j) throw new Error('サーバーから正しい返事がありませんでした。Apps Script の公開設定（アクセスできるユーザー：全員）を確認してください。');
   if (j.error) {
-    if (j.code === 401 && a !== 'login' && a !== 'change_password') { setSession(''); if (S.me) { S.me = null; render(); } }
+    if (j.code === 401 && a !== 'login' && a !== 'change_password') { setSession(''); clearSnap(); if (S.me) { S.me = null; render(); } }
     throw new Error(j.error);
   }
   if (j.token) setSession(j.token);
+  if (j.state) { setState(j.state); S._fresh = true; }
   return j;
 }
+/* サーバーから届いた最新の状態を画面のデータにする */
+function setState(d) {
+  Object.assign(S, { people: [], types: [], routes: [], requests: [], olderCount: 0 }, d);
+  saveSnap();
+}
+/* 前回の内容を端末に残し、次に開いたときすぐ表示する（ログアウトで消す） */
+const SNAP_KEY = 'dorm-snap';
+function saveSnap() {
+  try {
+    if (!S.me || !getSession()) { localStorage.removeItem(SNAP_KEY); return; }
+    localStorage.setItem(SNAP_KEY, JSON.stringify({ s: getSession().slice(0, 12), d: { org: S.org, me: S.me, people: S.people, types: S.types, routes: S.routes, requests: S.requests, olderCount: S.olderCount, needsInstall: false } }));
+  } catch {}
+}
+function readSnap() {
+  try { const o = JSON.parse(localStorage.getItem(SNAP_KEY) || 'null'); return o && getSession() && o.s === getSession().slice(0, 12) ? o.d : null; } catch { return null; }
+}
+function clearSnap() { try { localStorage.removeItem(SNAP_KEY); } catch {} }
 async function load() {
-  const d = await api('bootstrap');
-  Object.assign(S, { people: [], types: [], routes: [], requests: [] }, d);
+  const d = await api('bootstrap', S.showAll ? { all: true } : null);
+  setState(d);
 }
 async function refresh(animate = true) {
-  try { await load(); } catch (e) { toast(e.message); return; }
+  if (!S._fresh) { try { await load(); } catch (e) { toast(e.message); return; } }
+  S._fresh = false;
   render(animate);
 }
 
@@ -109,6 +137,55 @@ window.addEventListener('hashchange', () => { readHash(); render(); window.scrol
 /* ---------- top-level render ---------- */
 const app = $('#app');
 const seen = new Set(); let painted = false;
+const svg = d => `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const ICON = {
+  inbox: svg('<circle cx="12" cy="10" r="6.5"/><path d="M9.2 10.2l1.9 1.9 3.7-3.9"/><path d="M5 20h14"/>'),
+  apply: svg('<rect x="4" y="3.5" width="16" height="17" rx="2"/><path d="M12 8.5v7M8.5 12h7"/>'),
+  history: svg('<path d="M8 6.5h12M8 12h12M8 17.5h12"/><circle cx="4.2" cy="6.5" r=".9"/><circle cx="4.2" cy="12" r=".9"/><circle cx="4.2" cy="17.5" r=".9"/>'),
+  mails: svg('<rect x="3" y="5.5" width="18" height="13" rx="2"/><path d="M3.5 7l8.5 6 8.5-6"/>'),
+  setup: svg('<circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/>'),
+  user: svg('<circle cx="12" cy="8.5" r="3.8"/><path d="M4.5 20c1.2-3.8 4-5.6 7.5-5.6s6.3 1.8 7.5 5.6"/>')
+};
+const SHORT = { inbox: '承認', apply: '申請', history: '一覧', mails: 'メール', setup: '設定' };
+
+/* ---------- ホーム画面に追加（アプリとして使う） ---------- */
+let installEvt = null;
+const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isPhone = () => window.matchMedia('(max-width: 720px)').matches || /android|iphone|ipod/i.test(navigator.userAgent);
+const installDismissed = () => { try { return localStorage.getItem('dorm-install-hide') === '1'; } catch { return false; } };
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; if (S.me) render(); });
+window.addEventListener('appinstalled', () => { installEvt = null; toast('ホーム画面に追加しました'); if (S.me) render(); });
+function installBanner() {
+  if (isStandalone() || installDismissed() || !isPhone()) return '';
+  if (installEvt) return `<div class="install"><span>${ICON.apply}</span><p>ホーム画面に追加すると、アプリのようにすぐ開けます。</p><button class="btn btn-sm btn-primary" type="button" data-act="install">追加する</button><button class="btn-x" type="button" data-act="installHide" aria-label="閉じる">×</button></div>`;
+  if (isIOS()) return `<div class="install"><span>${ICON.apply}</span><p>ホーム画面に追加すると、アプリのようにすぐ開けます。Safari の共有ボタン（□に↑）から「ホーム画面に追加」を選んでください。</p><button class="btn-x" type="button" data-act="installHide" aria-label="閉じる">×</button></div>`;
+  return '';
+}
+function accountSheet() {
+  openModal({ title: 'アカウント',
+    render: () => `<p style="margin:0 0 4px"><b>${esc(S.me.name)}</b>（${esc(S.me.title || ROLE[S.me.role])}${S.me.room ? '・' + esc(S.me.room) : ''}）</p>
+      <p class="muted small" style="margin:0 0 16px">${esc(S.me.email || '')}</p>
+      <div class="sheet-actions">
+        <button class="btn" type="button" data-m="pw">パスワードを変更する</button>
+        ${!isStandalone() && installEvt ? '<button class="btn" type="button" data-m="install">ホーム画面に追加する</button>' : ''}
+        ${!isStandalone() && !installEvt && isIOS() ? '<p class="muted small">ホーム画面に追加するには、Safari の共有ボタン（□に↑）から「ホーム画面に追加」を選びます。</p>' : ''}
+        <button class="btn btn-danger" type="button" data-m="logout">ログアウト</button>
+      </div>`,
+    onClick: async b => {
+      if (b.dataset.m === 'pw') { closeModal(); changePassword(); }
+      if (b.dataset.m === 'install') { closeModal(); promptInstall(); }
+      if (b.dataset.m === 'logout') { closeModal(); doLogout(); }
+    } });
+}
+async function promptInstall() {
+  if (!installEvt) return;
+  installEvt.prompt();
+  try { await installEvt.userChoice; } catch {}
+  installEvt = null; render();
+}
+async function doLogout() { await api('logout', {}).catch(() => {}); setSession(''); clearSnap(); S.me = null; authMode = 'login'; await load().catch(() => {}); render(); }
+
 function render(animate = false) {
   const reset = new URLSearchParams(location.search).get('reset');
   document.title = `${S.org} 寮の申請・承認`;
@@ -117,13 +194,16 @@ function render(animate = false) {
   if (!S.me) return renderLogin();
   if (!viewsFor().some(v => v[0] === view)) readHash();
   const cnt = pendingFor(S.me.id).length;
+  const badge = k => k === 'inbox' && cnt ? `<span class="count" aria-label="承認待ち${cnt}件">${cnt}</span>` : '';
   app.innerHTML = `<header class="top"><div class="top-in">
       <div class="brand"><h1>寮の申請・承認</h1><p>${esc(S.org)}</p></div>
-      <div class="userbox"><span><b>${esc(S.me.name)}</b>（${esc(S.me.title || ROLE[S.me.role])}${S.me.room ? '・' + esc(S.me.room) : ''}）</span>
-        <button class="btn btn-sm" data-act="pw" type="button">パスワード変更</button><button class="btn btn-sm" data-act="logout" type="button">ログアウト</button></div>
+      <div class="userbox"><span><b>${esc(S.me.name)}</b><span class="role">（${esc(S.me.title || ROLE[S.me.role])}${S.me.room ? '・' + esc(S.me.room) : ''}）</span></span>
+        <button class="btn btn-sm desk" data-act="pw" type="button">パスワード変更</button><button class="btn btn-sm desk" data-act="logout" type="button">ログアウト</button>
+        <button class="btn btn-sm acct" data-act="account" type="button" aria-label="アカウント">${ICON.user}</button></div>
     </div>
-    <nav class="tabs" aria-label="画面の切り替え">${viewsFor().map(([k, l]) => `<button class="tab" type="button" data-act="go" data-view="${k}" aria-current="${view === k ? 'page' : 'false'}">${l}${k === 'inbox' && cnt ? ` <span class="count">${cnt}</span>` : ''}</button>`).join('')}</nav>
-  </header><main id="main"></main>`;
+    <nav class="tabs" aria-label="画面の切り替え">${viewsFor().map(([k, l]) => `<button class="tab" type="button" data-act="go" data-view="${k}" aria-current="${view === k ? 'page' : 'false'}">${l}${badge(k)}</button>`).join('')}</nav>
+  </header>${installBanner()}<main id="main"></main>
+  <nav class="bottomnav" aria-label="画面の切り替え">${viewsFor().map(([k, l]) => `<button type="button" data-act="go" data-view="${k}" aria-current="${view === k ? 'page' : 'false'}"><span class="ico">${ICON[k] || ''}${badge(k)}</span><span class="lbl">${SHORT[k] || l}</span></button>`).join('')}</nav>`;
   renderMain(animate);
 }
 function renderMain(animate = false) {
@@ -135,6 +215,18 @@ function renderMain(animate = false) {
     if (!seen.has(k)) { seen.add(k); if (animate && painted) el.classList.add('fresh'); }
   });
   painted = true;
+  labelTables(main);
+}
+/* スマホでは表をカード表示にするため、各セルに見出しを持たせる */
+function labelTables(root) {
+  root.querySelectorAll('table.list').forEach(t => {
+    const heads = [...t.querySelectorAll('thead th')].map(th => th.textContent.trim());
+    t.querySelectorAll('tbody tr').forEach(tr => {
+      const tds = tr.querySelectorAll(':scope > td');
+      if (tds.length === 1 && tds[0].colSpan > 1) { tr.classList.add('detailrow'); return; }
+      tds.forEach((td, i) => { if (heads[i]) td.dataset.label = heads[i]; else td.classList.add('nolabel'); });
+    });
+  });
 }
 
 /* ---------- login / install / reset ---------- */
@@ -187,7 +279,8 @@ document.addEventListener('submit', async e => {
       await api('setpw', { token: f.dataset.token, password: fd.password });
       history.replaceState(null, '', location.pathname);
     }
-    await load(); readHash(); render();
+    if (!S._fresh) await load();
+    S._fresh = false; readHash(); render();
   } catch (x) { err.textContent = x.message; btn.disabled = false; }
 });
 
@@ -337,7 +430,8 @@ function viewHistory() {
     <select data-hf="status" aria-label="状態で絞り込む"><option value="">すべての状態</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}"${hist.status === k ? ' selected' : ''}>${v}</option>`).join('')}</select>
     <select data-hf="type" aria-label="種類で絞り込む"><option value="">すべての種類</option>${S.types.map(t => `<option value="${t.id}"${String(hist.type) === String(t.id) ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
     <input type="text" data-hf="q" placeholder="名前・申請番号・行き先で検索" value="${esc(hist.q)}" aria-label="検索"></div>`;
-  const head = `<h2 class="view-title">申請一覧</h2><p class="lead">${scope}を新しい順に表示しています。行を選ぶと、いつ誰が承認したかを確認できます。</p>`;
+  const head = `<h2 class="view-title">申請一覧</h2><p class="lead">${scope}を新しい順に表示しています。行を選ぶと、いつ誰が承認したかを確認できます。</p>`
+    + (S.olderCount ? `<p class="small muted">1年より前に終わった申請 ${S.olderCount}件は表示していません。<button class="btn-link" type="button" data-act="showAll">表示する</button></p>` : '');
   if (!list.length) return head + filters + `<div class="panel empty"><h3>該当する申請はありません</h3><p>${S.requests.length ? '絞り込みを変えてください。' : 'まだ申請はありません。'}</p></div>`;
   const rows = list.map(r => {
     const open = hist.open === r.id;
@@ -404,7 +498,9 @@ function viewSetup() {
       <div class="grid2"><label class="fld"><span>メールの送信者名</span><input type="text" data-cfg="fromName" value="${esc(c.fromName)}" placeholder="${esc(c.org)} 寮"></label>
       <label class="fld"><span>返信先のメールアドレス（任意）</span><input type="email" data-cfg="replyTo" value="${esc(c.replyTo)}" placeholder="例：dorm@soshigakuen.ed.jp"></label></div>
       <p class="muted small">メールは Apps Script を公開した Google アカウントから送られます。今日あと ${esc(c.quota)} 人に送れます。</p>
-      <div class="actions"><button class="btn btn-primary" type="button" data-act="saveCfg">保存する</button><button class="btn" type="button" data-act="testMail">自分にテストメールを送る</button></div></div>`;
+      <div class="actions"><button class="btn btn-primary" type="button" data-act="saveCfg">保存する</button><button class="btn" type="button" data-act="testMail">自分にテストメールを送る</button></div>
+      <p class="muted small" style="margin:18px 0 6px">スプレッドシートを直接書き換えたときは、次のボタンで読み直してください（画面を速くするため、データを一時的に保存しています）。</p>
+      <button class="btn btn-sm" type="button" data-act="reloadData">スプレッドシートから読み直す</button></div>`;
   }
   return head + nav + body;
 }
@@ -591,28 +687,49 @@ document.addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === 
 document.addEventListener('click', async e => {
   const b = e.target.closest('[data-act]'); if (!b || !app.contains(b)) return;
   const a = b.dataset.act, id = Number(b.dataset.id || 0);
-  const busy = async fn => { b.disabled = true; try { await fn(); } catch (x) { toast(x.message); } finally { b.disabled = false; } };
+  const busy = async fn => { const label = b.innerHTML; b.disabled = true; if (b.matches('.btn')) b.textContent = '処理中…'; try { await fn(); } catch (x) { toast(x.message); } finally { if (b.isConnected) { b.disabled = false; b.innerHTML = label; } } };
   switch (a) {
     case 'go': go(b.dataset.view); break;
     case 'toForgot': authMode = 'forgot'; renderLogin(); break;
     case 'toLogin': authMode = 'login'; renderLogin(); break;
-    case 'logout': await api('logout', {}).catch(() => {}); setSession(''); S.me = null; authMode = 'login'; await load().catch(() => {}); render(); break;
+    case 'logout': await doLogout(); break;
+    case 'account': accountSheet(); break;
+    case 'install': promptInstall(); break;
+    case 'installHide': try { localStorage.setItem('dorm-install-hide', '1'); } catch {} render(); break;
     case 'pw': changePassword(); break;
     case 'submit': await busy(async () => {
       const t = S.types.find(x => x.id === applyState.typeId);
       const missing = t.fields.filter((f, i) => f.required && !String(applyState.values[i] ?? '').trim()).map(f => f.label);
       if (missing.length) { $('#applyErr').textContent = `次の項目を入力してください：${missing.join('、')}`; return; }
       const r = await api('submit', { typeId: t.id, studentId: applyState.studentId, values: t.fields.map((f, i) => applyState.values[i] ?? '') });
-      applyState.values = {}; toast(r.message); hist.open = r.request.id; await load(); go('history');
+      applyState.values = {}; toast(r.message); hist.open = r.request.id; S._fresh = false; go('history');
     }); break;
     case 'ok': case 'ng':
       if (a === 'ng' && !confirm('この申請を「承認しない」にしますか？寮生とほかの承認者に通知されます。')) return;
-      await busy(async () => { const r = await api('decide', { requestId: id, ok: a === 'ok', comment: commentDraft[id] || '' }); delete commentDraft[id]; toast(r.message); await refresh(true); });
+      {
+        // 押した瞬間に印を押した状態にして、サーバーへの記録は裏で行う
+        const before = JSON.stringify(S.requests);
+        const r = reqById(id), st = r && r.steps.find(x => x.approverId === S.me.id && x.status === 'pending');
+        const comment = commentDraft[id] || '';
+        if (st) {
+          const d = new Date(), nowS = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+          st.status = a === 'ok' ? 'approved' : 'rejected'; st.decidedAt = nowS; st.comment = comment;
+          if (a === 'ng') { r.status = 'rejected'; r.closedAt = nowS; r.steps.forEach(x => { if (x.status === 'pending') x.status = 'closed'; }); }
+          else if (r.steps.every(x => x.status === 'approved')) { r.status = 'approved'; r.closedAt = nowS; }
+          delete commentDraft[id];
+          render(true);
+          toast(a === 'ok' ? '承認しました。記録しています…' : '非承認にしました。記録しています…');
+        }
+        try { const res = await api('decide', { requestId: id, ok: a === 'ok', comment }); toast(res.message); S._fresh = false; render(false); }
+        catch (x) { S.requests = JSON.parse(before); commentDraft[id] = comment; toast('記録できませんでした：' + x.message); render(false); refresh(false); }
+      }
       break;
     case 'withdraw':
       if (!confirm('この申請を取り下げますか？')) return;
       await busy(async () => { const r = await api('withdraw', { requestId: id }); toast(r.message); await refresh(true); }); break;
     case 'open': hist.open = hist.open === id ? 0 : id; renderMain(); break;
+    case 'showAll': S.showAll = true; await busy(async () => { await load(); render(); }); break;
+    case 'reloadData': await busy(async () => { const r = await api('reload_data', {}); toast(r.message); cfgState.data = null; await refresh(false); }); break;
     case 'apopen': go('r-' + id); break;
     case 'aptab': ap.tab = b.dataset.k; renderMain(); break;
     case 'cert': showCert(id); break;
@@ -646,6 +763,20 @@ setInterval(() => {
   load().then(() => { if (!typing() && $('#modal').hidden) { const y = window.scrollY; render(true); window.scrollTo(0, y); } }).catch(() => {});
 }, 60000);
 
+/* アプリに戻ってきたら最新にする */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !S.me || !$('#modal').hidden || typing()) return;
+  load().then(() => { if (!typing() && $('#modal').hidden) { const y = window.scrollY; render(true); window.scrollTo(0, y); } }).catch(() => {});
+});
+
+/* オフラインでも画面を開けるようにする */
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || /^(localhost|127\.0\.0\.1)$/.test(location.hostname))) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+
 /* ---------- start ---------- */
-load().then(() => { readHash(); render(); }).catch(e => { app.innerHTML = `<div class="auth"><div class="panel"><p class="err">${esc(e.message)}</p><button class="btn" onclick="location.reload()">読み込み直す</button></div></div>`; });
+const snap = readSnap();
+if (snap) { Object.assign(S, { people: [], types: [], routes: [], requests: [] }, snap); readHash(); render(); }
+load().then(() => { if (!snap) readHash(); if (!typing() && $('#modal').hidden) render(!!snap); }).catch(e => {
+  if (snap) { toast(e.message); return; } app.innerHTML = `<div class="auth"><div class="panel"><p class="err">${esc(e.message)}</p><button class="btn" onclick="location.reload()">読み込み直す</button></div></div>`; });
 })();

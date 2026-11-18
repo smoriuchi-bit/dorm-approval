@@ -15,6 +15,7 @@
   }
 }
 *,*::before,*::after{box-sizing:border-box}
+[hidden]{display:none !important}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.7;-webkit-font-smoothing:antialiased;
   padding-bottom:env(safe-area-inset-bottom,0px)}
 button,input,select,textarea{font:inherit;color:inherit}
@@ -209,3 +210,96 @@ legend{font-size:13px;font-weight:500;color:var(--muted);padding:0 6px}
 
 @media (prefers-reduced-motion:reduce){.seal.fresh{animation:none}#toast{transition:none}}
 @media print{.top,.tabs{display:none}}
+
+/* ===== 処理中の細いバー ===== */
+html.is-busy body::after{content:"";position:fixed;left:0;right:0;top:0;height:3px;z-index:50;
+  background:linear-gradient(90deg,transparent 0,var(--ai) 30%,var(--shu) 50%,var(--ai) 70%,transparent 100%);background-size:200% 100%;
+  animation:busy 1s linear infinite}
+@keyframes busy{from{background-position:100% 0}to{background-position:-100% 0}}
+
+/* ===== アカウント・ホーム画面に追加 ===== */
+.userbox .acct{display:none;width:40px;padding:0}
+.userbox .role{color:var(--muted)}
+.sheet-actions{display:grid;gap:10px}
+.sheet-actions .btn{min-height:48px;font-size:15px}
+.install{max-width:1080px;margin:12px auto 0;padding:10px 12px;display:flex;gap:10px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:10px;font-size:13px}
+.install > span{color:var(--ai);display:flex}
+.install p{margin:0;flex:1}
+.btn-x{appearance:none;border:0;background:none;font-size:20px;line-height:1;color:var(--muted);cursor:pointer;width:32px;height:32px}
+.bottomnav{display:none}
+
+/* ===== スマホ ===== */
+@media (max-width:720px){
+  body{font-size:16px}
+  .top{position:sticky}
+  .top-in{padding:10px 16px;align-items:center;flex-wrap:nowrap}
+  .brand h1{font-size:18px}
+  .brand p{font-size:12px}
+  .userbox{flex-wrap:nowrap;gap:8px}
+  .userbox > span{max-width:42vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+  .userbox .role{display:none}
+  .userbox .desk{display:none}
+  .userbox .acct{display:inline-flex}
+  .tabs{display:none}
+  .install{margin:10px 12px 0}
+  main{padding:18px 14px calc(96px + env(safe-area-inset-bottom,0px))}
+  h2.view-title{font-size:19px}
+  .lead{font-size:14px;margin-bottom:14px}
+  .panel{padding:16px}
+  .btn{min-height:44px}
+  .btn-sm{min-height:38px}
+  input[type=text],input[type=email],input[type=password],input[type=tel],input[type=number],input[type=date],input[type=datetime-local],select,textarea{font-size:16px;min-height:46px}
+
+  /* 下のタブ */
+  .bottomnav{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:6;background:var(--surface);border-top:1px solid var(--line);
+    padding:4px 4px calc(4px + env(safe-area-inset-bottom,0px))}
+  .bottomnav button{flex:1;appearance:none;border:0;background:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:1px;
+    padding:6px 2px;min-height:54px;font-size:11px;font-weight:500;cursor:pointer;border-radius:8px}
+  .bottomnav button[aria-current="page"]{color:var(--ai)}
+  .bottomnav button[aria-current="page"] .ico{background:var(--surface-2)}
+  .bottomnav .ico{position:relative;display:flex;align-items:center;justify-content:center;width:52px;height:30px;border-radius:15px}
+  .bottomnav .count{position:absolute;top:-4px;right:2px;min-width:18px;height:18px;font-size:10px;padding:0 5px}
+
+  /* 承認者画面のタブを横に流せるように */
+  .seg{display:flex;width:100%}
+  .seg button{flex:1 0 auto;padding:9px 12px;font-size:14px}
+  .me-card{padding:12px 14px}
+  .me-card .muted.small{display:none}
+
+  /* 申請カード：ボタンを大きく */
+  .reqcard{padding:16px}
+  .reqcard .decide .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .reqcard .decide .btn{min-height:50px;font-size:16px}
+  .kv{grid-template-columns:minmax(84px,max-content) 1fr;gap:4px 12px}
+
+  /* 表はカードとして並べる */
+  .tablewrap{background:none;border:0;overflow:visible}
+  table.list{min-width:0;display:block}
+  table.list thead{display:none}
+  table.list tbody{display:grid;gap:10px}
+  table.list tr{display:block;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+  table.list tr.detailrow{border-top:0;border-radius:0 0 10px 10px;margin-top:-12px;padding:0}
+  table.list td{display:block;position:relative;padding:4px 0 4px 7.5em;border:0;font-size:14px;min-height:28px}
+  table.list td::before{content:attr(data-label);position:absolute;left:0;top:6px;color:var(--muted);font-size:12px}
+  table.list td.nolabel,table.list td.detail{padding-left:0}
+  table.list td.nolabel{display:block}
+  table.list td.nolabel::before{content:none}
+  table.list td.detail{display:block;padding:14px}
+  table.list td.detail::before{content:none}
+  table.list tr.row:hover td{background:none}
+  .filters > *{max-width:none;flex:1 1 45%}
+  .timeline li{grid-template-columns:1fr}
+
+  .subnav{flex-wrap:nowrap;overflow-x:auto;padding-bottom:4px}
+  .subnav button{white-space:nowrap}
+  .mbox{padding:18px 16px 14px}
+  .mfoot .btn{flex:1}
+  .modal{align-items:flex-end;padding:0}
+  .mbox{border-radius:16px 16px 0 0;max-height:92vh;overflow-y:auto;padding-bottom:calc(14px + env(safe-area-inset-bottom,0px))}
+  #toast{bottom:calc(84px + env(safe-area-inset-bottom,0px))}
+  .certwrap{max-height:60vh}
+}
+/* ホーム画面から開いたとき */
+@media (display-mode: standalone){
+  .top{padding-top:env(safe-area-inset-top,0px)}
+}
