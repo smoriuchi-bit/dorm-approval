@@ -45,6 +45,7 @@ function setup() {
   var props = PropertiesService.getScriptProperties();
   if (!props.getProperty('PEPPER')) props.setProperty('PEPPER', Utilities.getUuid() + Utilities.getUuid());
   props.setProperty('SPREADSHEET_ID', ss.getId());
+  try { clearCache(); } catch (e) {}
   // メール送信の権限確認のために残りの送信可能数を読む
   Logger.log('準備ができました。1日に送れるメールの残り：' + MailApp.getRemainingDailyQuota() + '通');
 }
@@ -60,66 +61,152 @@ function doPost(e) {
   var a = String(input.a || '');
   var fn = ACTIONS[a];
   if (!fn) return json_({ error: '不明な操作です。' });
-  var lock = WRITE_ACTIONS[a] ? LockService.getScriptLock() : null;
+  DB_ = {}; DIRTY_ = {}; SS_ = null; HAS_LOCK_ = false;
   try {
-    if (lock) lock.waitLock(30000);
-    DB_ = {};
+    if (WRITE_ACTIONS[a]) lock_();
+    loadCached_();
     var ctx = { input: input, token: String(input.session || ''), me: null };
     ctx.me = currentUser_(ctx.token);
-    return json_(fn(ctx) || { ok: true });
+    var out = fn(ctx) || { ok: true };
+    // 書き込みのあとは最新の状態もいっしょに返し、画面が読み直さなくて済むようにする
+    if (STATE_ACTIONS[a] && ctx.me && !out.error) out.state = ACTIONS.bootstrap(ctx);
+    saveCache_();
+    return json_(out);
   } catch (err) {
+    dropCache_();
     if (err && err.userMessage) return json_({ error: err.userMessage, code: err.code || 400 });
     console.error(err && err.stack || err);
     return json_({ error: 'サーバーでエラーが起きました。管理者に連絡してください。（' + (err && err.message || err) + '）', code: 500 });
   } finally {
-    if (lock) try { lock.releaseLock(); } catch (x) {}
+    if (HAS_LOCK_) try { LockService.getScriptLock().releaseLock(); } catch (x) {}
+    HAS_LOCK_ = false;
   }
 }
 
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
 function fail_(msg, code) { var e = new Error(msg); e.userMessage = msg; e.code = code || 400; throw e; }
 
-/* ===================== スプレッドシートを表として使う ===================== */
-var DB_ = {};
+/**
+ * スプレッドシートを直接書き換えたときに実行してください（キャッシュを捨てて読み直します）。
+ * 管理者は画面の「設定 → 基本設定 → スプレッドシートから読み直す」でも同じことができます。
+ */
+function clearCache() { CacheService.getScriptCache().removeAll(CACHED_TABLES.map(function (n) { return CKEY + n; })); Logger.log('キャッシュを消しました。'); }
+
+/* ===================== スプレッドシートを表として使う =====================
+ * 速さのため、よく使う表は Apps Script のキャッシュに丸ごと置き、1回の呼び出しでまとめて読みます。
+ * 書き込みは必ずスプレッドシートに行い、そのあとキャッシュも新しくします。
+ * 送信メールの記録（mails）は大きくなるため、キャッシュせず必要な行だけ読み書きします。 */
+var CACHED_TABLES = ['users', 'guardians', 'routes', 'route_steps', 'types', 'requests', 'steps', 'sessions', 'tokens', 'settings'];
+var CKEY = 'dorm2:';
+var CACHE_TTL = 21600;      // キャッシュを保つ秒数（最大6時間）
+var CHUNK = 25000;          // キャッシュ1件に入れる文字数
+var DB_ = {}, DIRTY_ = {}, SS_ = null, HAS_LOCK_ = false;
+
+function lock_() { if (!HAS_LOCK_) { LockService.getScriptLock().waitLock(30000); HAS_LOCK_ = true; } }
 function ss_() {
+  if (SS_) return SS_;
   var id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
-  return id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActiveSpreadsheet();
+  SS_ = id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActiveSpreadsheet();
+  return SS_;
+}
+function sheet_(t) {
+  if (!t.sh) {
+    t.sh = ss_().getSheetByName(t.name);
+    if (!t.sh) fail_('シート「' + t.name + '」がありません。Apps Script で setup を実行してください。', 500);
+  }
+  return t.sh;
+}
+function makeTable_(name, last, rowsArr) {
+  var head = SCHEMA[name];
+  var rows = rowsArr.map(function (v) { var o = { _row: Number(v[0]) }; head.forEach(function (h, j) { o[h] = v[j + 1]; }); return o; });
+  return { name: name, sh: null, head: head, rows: rows, last: last };
+}
+/** キャッシュにある表を、まとめて2回の呼び出しで読む */
+function loadCached_() {
+  var cache = CacheService.getScriptCache();
+  var metas = cache.getAll(CACHED_TABLES.map(function (n) { return CKEY + n; }));
+  var want = [], info = {};
+  CACHED_TABLES.forEach(function (n) {
+    var m = metas[CKEY + n]; if (!m) return;
+    try { m = JSON.parse(m); } catch (e) { return; }
+    info[n] = m;
+    for (var i = 0; i < m.n; i++) want.push(CKEY + n + ':' + m.v + ':' + i);
+  });
+  if (!want.length) return;
+  var parts = cache.getAll(want);
+  Object.keys(info).forEach(function (n) {
+    var m = info[n], str = '';
+    for (var i = 0; i < m.n; i++) { var p = parts[CKEY + n + ':' + m.v + ':' + i]; if (p === undefined || p === null) return; str += p; }
+    try { DB_[n] = makeTable_(n, m.last, JSON.parse(str)); } catch (e) {}
+  });
 }
 function table_(name) {
   if (DB_[name]) return DB_[name];
-  var sh = ss_().getSheetByName(name);
-  if (!sh) fail_('シート「' + name + '」がありません。Apps Script で setup を実行してください。', 500);
-  var head = SCHEMA[name];
+  // キャッシュにないときは、書き込みと重ならないよう鍵をかけてからシートを読む
+  lock_();
+  var t = { name: name, sh: null, head: SCHEMA[name], rows: [], last: 1 };
+  var sh = sheet_(t);
   var n = sh.getLastRow();
-  var vals = n > 1 ? sh.getRange(2, 1, n - 1, head.length).getDisplayValues() : [];
-  var rows = vals.map(function (v, i) {
+  var vals = n > 1 ? sh.getRange(2, 1, n - 1, t.head.length).getDisplayValues() : [];
+  t.rows = vals.map(function (v, i) {
     var o = { _row: i + 2 };
-    head.forEach(function (h, j) { o[h] = v[j]; });
+    t.head.forEach(function (h, j) { o[h] = v[j]; });
     return o;
-  }).filter(function (o) { return o[head[0]] !== ''; });
-  DB_[name] = { name: name, sh: sh, head: head, rows: rows };
-  return DB_[name];
+  }).filter(function (o) { return o[t.head[0]] !== ''; });
+  t.last = Math.max(n, 1);
+  DB_[name] = t;
+  if (CACHED_TABLES.indexOf(name) >= 0) DIRTY_[name] = true;
+  return t;
 }
+function saveCache_() {
+  var names = Object.keys(DIRTY_);
+  if (!names.length) return;
+  var put = {};
+  var ver = String(Date.now());
+  names.forEach(function (n) {
+    var t = DB_[n];
+    var str = JSON.stringify(t.rows.map(function (r) { return [r._row].concat(t.head.map(function (h) { return r[h]; })); }));
+    var k = 0;
+    for (var i = 0; i < str.length || i === 0; i += CHUNK) { put[CKEY + n + ':' + ver + ':' + k] = str.substring(i, i + CHUNK); k++; if (!str.length) break; }
+    put[CKEY + n] = JSON.stringify({ n: k, last: t.last, v: ver });
+  });
+  try { CacheService.getScriptCache().putAll(put, CACHE_TTL); } catch (e) { dropCache_(); }
+}
+function dropCache_() {
+  var names = Object.keys(DIRTY_);
+  if (names.length) try { CacheService.getScriptCache().removeAll(names.map(function (n) { return CKEY + n; })); } catch (e) {}
+}
+
 function all_(name) { return table_(name).rows; }
 function find_(name, pred) { var r = all_(name); for (var i = 0; i < r.length; i++) if (pred(r[i])) return r[i]; return null; }
 function where_(name, pred) { return all_(name).filter(pred); }
 function byId_(name, id) { id = String(id); return find_(name, function (r) { return r.id === id; }); }
 function str_(v) { return v === null || v === undefined ? '' : (typeof v === 'boolean' ? (v ? '1' : '0') : String(v)); }
-function rowVals_(t, o) { return t.head.map(function (h) { return str_(o[h]); }); }
+function rowVals_(head, o) { return head.map(function (h) { return str_(o[h]); }); }
 function nextId_(name) { var m = 0; all_(name).forEach(function (r) { var n = Number(r.id) || 0; if (n > m) m = n; }); return m + 1; }
+function writeRow_(sh, row, head, o) {
+  var rg = sh.getRange(row, 1, 1, head.length);
+  if (row > 1000) rg.setNumberFormat('@');   // setup で1000行目までは文字列の書式にしてある
+  rg.setValues([rowVals_(head, o)]);
+}
 function insert_(name, o) {
   var t = table_(name);
+  lock_();
   if (t.head[0] === 'id' && !o.id) o.id = nextId_(name);
-  var row = t.sh.getLastRow() + 1;
-  t.sh.getRange(row, 1, 1, t.head.length).setNumberFormat('@').setValues([rowVals_(t, o)]);
+  var row = t.last + 1;
+  writeRow_(sheet_(t), row, t.head, o);
+  t.last = row;
   var copy = { _row: row }; t.head.forEach(function (h) { copy[h] = str_(o[h]); });
   t.rows.push(copy);
+  DIRTY_[name] = true;
   return copy;
 }
 function update_(name, rowObj, changes) {
   var t = table_(name);
+  lock_();
   Object.keys(changes).forEach(function (k) { rowObj[k] = str_(changes[k]); });
-  t.sh.getRange(rowObj._row, 1, 1, t.head.length).setNumberFormat('@').setValues([rowVals_(t, rowObj)]);
+  writeRow_(sheet_(t), rowObj._row, t.head, rowObj);
+  DIRTY_[name] = true;
   return rowObj;
 }
 /** 条件に合う行を消して、表を書き直す（行数の少ない表で使う） */
@@ -127,13 +214,41 @@ function removeWhere_(name, pred) {
   var t = table_(name);
   var keep = t.rows.filter(function (r) { return !pred(r); });
   if (keep.length === t.rows.length) return 0;
-  var removed = t.rows.length - keep.length;
-  var last = t.sh.getLastRow();
-  if (last > 1) t.sh.getRange(2, 1, last - 1, t.head.length).clearContent();
-  if (keep.length) t.sh.getRange(2, 1, keep.length, t.head.length).setNumberFormat('@').setValues(keep.map(function (r) { return rowVals_(t, r); }));
+  lock_();
+  var sh = sheet_(t);
+  if (t.last > 1) sh.getRange(2, 1, t.last - 1, t.head.length).clearContent();
+  if (keep.length) sh.getRange(2, 1, keep.length, t.head.length).setValues(keep.map(function (r) { return rowVals_(t.head, r); }));
   keep.forEach(function (r, i) { r._row = i + 2; });
+  var removed = t.rows.length - keep.length;
   t.rows = keep;
+  t.last = keep.length + 1;
+  DIRTY_[name] = true;
   return removed;
+}
+
+/* 送信メールの記録：番号＝行番号−1。全体は読まずに1行ずつ書く */
+var MAIL_HEAD = SCHEMA.mails;
+function mailSheet_() { return sheet_(DB_.__mails || (DB_.__mails = { name: 'mails', sh: null })); }
+function mailInsert_(o) {
+  lock_();
+  var sh = mailSheet_();
+  var row = Math.max(sh.getLastRow(), 1) + 1;
+  o.id = row - 1;
+  writeRow_(sh, row, MAIL_HEAD, o);
+  var copy = { _row: row }; MAIL_HEAD.forEach(function (h) { copy[h] = str_(o[h]); });
+  return copy;
+}
+function mailUpdate_(m, changes) {
+  lock_();
+  Object.keys(changes).forEach(function (k) { m[k] = str_(changes[k]); });
+  writeRow_(mailSheet_(), m._row, MAIL_HEAD, m);
+}
+function mailRows_(fromRow, count) {
+  var sh = mailSheet_();
+  if (count <= 0) return [];
+  return sh.getRange(fromRow, 1, count, MAIL_HEAD.length).getDisplayValues().map(function (v, i) {
+    var o = { _row: fromRow + i }; MAIL_HEAD.forEach(function (h, j) { o[h] = v[j]; }); return o;
+  }).filter(function (o) { return o.id !== ''; });
 }
 
 /* ===================== 小さな道具 ===================== */
@@ -254,7 +369,7 @@ function sendMail_(to, subject, body, opt) {
     html += '</p><p style="font-size:12px;color:#5B6874;margin:0">ボタンが押せない場合は、テキスト版のメールにあるアドレスを開いてください。</p>';
   }
   html += '<p style="font-size:12px;color:#5B6874;border-top:1px solid #D3DAD9;padding-top:10px;margin-top:26px">' + esc_(org) + ' 申請・承認システムからの自動送信です。</p></div>';
-  var m = insert_('mails', {
+  var m = mailInsert_({
     request_id: opt.request_id || '', to_addr: JSON.stringify(addrs), to_names: JSON.stringify(names),
     subject: subject, body: text, html: html, status: addrs.length ? 'sending' : 'skipped',
     error: addrs.length ? '' : '送り先のメールアドレスが登録されていません', created_at: now_(), sent_at: ''
@@ -269,10 +384,10 @@ function deliver_(m) {
     var o = { to: to.join(','), subject: m.subject, body: m.body, htmlBody: m.html, name: setting_('mail_from_name') || (org_() + ' 寮') };
     var reply = setting_('mail_reply_to'); if (validEmail_(reply)) o.replyTo = reply;
     MailApp.sendEmail(o);
-    update_('mails', m, { status: 'sent', error: '', sent_at: now_() });
+    mailUpdate_(m, { status: 'sent', error: '', sent_at: now_() });
     return 'sent';
   } catch (e) {
-    update_('mails', m, { status: 'failed', error: String(e && e.message || e).substring(0, 300) });
+    mailUpdate_(m, { status: 'failed', error: String(e && e.message || e).substring(0, 300) });
     return 'failed';
   }
 }
@@ -375,8 +490,11 @@ function decideStep_(step, ok, comment) {
 }
 
 /* ===================== 操作の一覧 ===================== */
-var WRITE_ACTIONS = { install: 1, login: 1, logout: 1, forgot: 1, setpw: 1, change_password: 1, submit: 1, decide: 1, withdraw: 1, approve_decide: 1,
+var WRITE_ACTIONS = { reload_data: 1, install: 1, login: 1, logout: 1, forgot: 1, setpw: 1, change_password: 1, submit: 1, decide: 1, withdraw: 1, approve_decide: 1,
   resend: 1, test_mail: 1, save_settings: 1, save_user: 1, delete_user: 1, save_route: 1, delete_route: 1, save_type: 1, delete_type: 1, sample: 1 };
+
+var STATE_ACTIONS = { install: 1, login: 1, setpw: 1, submit: 1, decide: 1, withdraw: 1, save_settings: 1, save_user: 1, delete_user: 1,
+  save_route: 1, delete_route: 1, save_type: 1, delete_type: 1, sample: 1, reload_data: 1 };
 
 var ACTIONS = {
   /* ----- 起動・ログイン ----- */
@@ -392,11 +510,18 @@ var ACTIONS = {
       var f = []; try { f = JSON.parse(t.fields || '[]'); } catch (e) {}
       return { id: Number(t.id), name: t.name, certTitle: t.cert_title, routeId: t.route_id ? Number(t.route_id) : null, notifyGuardians: t.notify_guardians === '1', active: t.active === '1', sort: Number(t.sort) || 0, fields: f };
     });
+    // 1年より前に終わった申請は、頼まれたときだけ送る（画面を軽く保つため）
+    var reqs = visibleRequests_(me), older = 0;
+    if (!ctx.input.all) {
+      var since = Utilities.formatDate(new Date(Date.now() - 365 * 86400000), TZ, 'yyyy-MM-dd');
+      var recent = reqs.filter(function (r) { return r.status === 'pending' || String(r.createdAt) >= since; });
+      older = reqs.length - recent.length; reqs = recent;
+    }
     var routes = all_('routes').slice().sort(function (a, b) { return a.name.localeCompare(b.name, 'ja'); }).map(function (r) {
       return { id: Number(r.id), name: r.name, steps: where_('route_steps', function (s) { return s.route_id === r.id; }).sort(function (a, b) { return Number(a.sort) - Number(b.sort); })
         .map(function (s) { var u = byId_('users', s.approver_id) || {}; return { approverId: Number(s.approver_id), name: u.name || '（削除済み）', title: u.title || '', active: u.active === '1' }; }) };
     });
-    return { org: base.org, needsInstall: false, me: userPublic_(me, true), people: people, types: types, routes: routes, requests: visibleRequests_(me), mailMode: 'gmail', appUrl: appUrl_() };
+    return { org: base.org, needsInstall: false, me: userPublic_(me, true), people: people, types: types, routes: routes, requests: reqs, olderCount: older, mailMode: 'gmail', appUrl: appUrl_() };
   },
 
   install: function (ctx) {
@@ -409,6 +534,7 @@ var ACTIONS = {
     if (i.appUrl) setSetting_('app_url', clip_(i.appUrl, 300));
     var u = insert_('users', { name: name, email: email, role: 'staff', title: clip_(i.title, 50), room: '', homeroom_id: '', is_admin: 1, pw_hash: '', pw_salt: '', active: 1, created_at: now_() });
     setPassword_(u, pw);
+    ctx.me = u;
     return { ok: true, token: startSession_(u.id) };
   },
 
@@ -424,6 +550,7 @@ var ACTIONS = {
       fail_('メールアドレスかパスワードが違います。', 401);
     }
     cache.remove(key);
+    ctx.me = u;
     return { ok: true, token: startSession_(u.id) };
   },
 
@@ -453,6 +580,7 @@ var ACTIONS = {
     if (!u || u.active !== '1') fail_('このアカウントは使えません。管理者に連絡してください。');
     setPassword_(u, pw);
     removeWhere_('tokens', function (x) { return x.user_id === u.id && x.purpose === 'pw'; });
+    ctx.me = u;
     return { ok: true, token: startSession_(u.id) };
   },
 
@@ -524,14 +652,16 @@ var ACTIONS = {
   /* ----- 管理者 ----- */
   mails: function (ctx) {
     needAdmin_(ctx);
-    var list = all_('mails').slice().sort(function (a, b) { return Number(b.id) - Number(a.id); }).slice(0, 300).map(function (m) {
+    var last = mailSheet_().getLastRow(), from = Math.max(2, last - 299);
+    var list = mailRows_(from, last - from + 1).reverse().map(function (m) {
       return { id: Number(m.id), request_id: m.request_id, to_addr: JSON.parse(m.to_addr || '[]'), to_names: JSON.parse(m.to_names || '[]'), subject: m.subject, body: m.body, status: m.status, error: m.error, created_at: m.created_at, sent_at: m.sent_at };
     });
     return { mails: list, quota: MailApp.getRemainingDailyQuota() };
   },
   resend: function (ctx) {
     needAdmin_(ctx);
-    var m = byId_('mails', ctx.input.id);
+    var mid = Number(ctx.input.id) || 0;
+    var m = mid > 0 ? mailRows_(mid + 1, 1)[0] : null;
     if (!m) fail_('メールが見つかりません。');
     var st = deliver_(m);
     return { message: st === 'failed' ? '送れませんでした。エラー内容を確認してください。' : 'メールを送りました。' };
@@ -548,6 +678,13 @@ var ACTIONS = {
     setSetting_('mail_from_name', clip_(ctx.input.fromName, 100));
     setSetting_('mail_reply_to', validEmail_(ctx.input.replyTo) ? clip_(ctx.input.replyTo, 255) : '');
     return { ok: true };
+  },
+  reload_data: function (ctx) {
+    needAdmin_(ctx);
+    CacheService.getScriptCache().removeAll(CACHED_TABLES.map(function (n) { return CKEY + n; }));
+    DB_ = {}; DIRTY_ = {};
+    ctx.me = byId_('users', ctx.me.id);
+    return { message: 'スプレッドシートから読み直しました。' };
   },
   get_settings: function (ctx) {
     needAdmin_(ctx);
