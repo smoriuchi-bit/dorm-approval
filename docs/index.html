@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>寮の申請・承認</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700&family=Zen+Old+Mincho:wght@700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/app.css?v=2.0.0">
+</head>
+<body>
+<div id="app"><p class="boot">読み込み中…</p></div>
+<div class="modal" id="modal" hidden role="dialog" aria-modal="true" aria-labelledby="mTitle">
+  <div class="mbox" id="mBox">
+    <h2 id="mTitle"></h2>
+    <div id="mBody"></div>
+    <p class="err" id="mErr" role="alert"></p>
+    <div class="mfoot"><button class="btn" id="mCancel" type="button">閉じる</button><button class="btn btn-primary" id="mSave" type="button">保存する</button></div>
+  </div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="certStage" aria-hidden="true"></div>
+<script src="config.js?v=2.0.0"></script>
+<script src="assets/vendor/html2canvas.min.js"></script>
+<script src="assets/vendor/jspdf.umd.min.js"></script>
+<script src="assets/app.js?v=2.0.0"></script>
+</body>
+</html>

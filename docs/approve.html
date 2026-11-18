@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>承認の確認</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700&family=Zen+Old+Mincho:wght@700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/app.css?v=2.0.0">
+</head>
+<body class="solo">
+<main class="solo-main">
+  <p class="solo-org" id="org">&nbsp;</p>
+  <div class="panel" id="box"><p class="muted">読み込み中…</p></div>
+</main>
+<script src="config.js?v=2.0.0"></script>
+<script>
+(() => {
+  'use strict';
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const fmt = s => s ? String(s).slice(0, 16).replace(/-/g, '/') : '';
+  const fmtVal = (k, v) => v === '' || v == null ? '—' : k === 'datetime' ? String(v).replace('T', ' ').replace(/-/g, '/') : k === 'date' ? String(v).replace(/-/g, '/') : String(v);
+  const STATUS = { pending: '承認待ち', approved: '許可', rejected: '非承認', withdrawn: '取り下げ' };
+  const STEP = { pending: '承認待ち', approved: '承認', rejected: '非承認', closed: '—' };
+  const orig = location.href;
+  const q = new URLSearchParams(location.search);
+  const t = (q.get('t') || '').replace(/[^a-f0-9]/g, '');
+  const pre = q.get('d') === 'ng' ? 'ng' : 'ok';
+  // リンクの鍵をアドレス欄から消して、履歴や画面共有に残らないようにする
+  if (q.has('t')) history.replaceState(null, '', location.pathname);
+  const box = document.getElementById('box');
+  const home = (location.pathname.replace(/[^/]*$/, '')) + '#inbox';
+
+  async function call(a, data) {
+    if (!window.DORM_API || /XXXX/.test(window.DORM_API)) throw new Error('config.js にApps ScriptのURLが書かれていません。');
+    let res;
+    try { res = await fetch(window.DORM_API, { method: 'POST', body: JSON.stringify(Object.assign({ a }, data)) }); }
+    catch { throw new Error('サーバーにつながりません。通信状況を確かめてください。'); }
+    const j = await res.json().catch(() => null);
+    if (!j) throw new Error('サーバーから正しい返事がありませんでした。');
+    if (j.error) throw new Error(j.error);
+    return j;
+  }
+  function show(title, html) {
+    box.innerHTML = `<h1 class="solo-title">${esc(title)}</h1>${html}`;
+    box.querySelector('h1').setAttribute('tabindex', '-1'); box.querySelector('h1').focus();
+  }
+  function render(info) {
+    document.getElementById('org').textContent = `${info.org} 寮の申請・承認`;
+    document.title = `承認の確認｜${info.org}`;
+    if (!info.request) return show('このリンクは使えません', `<p>すでに回答済みか、取り下げられた申請のリンクです。申請の状況は承認者画面で確認できます。</p><p class="actions"><a class="btn" href="${home}">承認者画面を開く</a></p>`);
+    const r = info.request;
+    if (!info.valid) return show('回答は不要です', `<p>この申請は「${esc(STATUS[r.status] || r.status)}」になっています。</p><p class="actions"><a class="btn" href="${home}">承認者画面を開く</a></p>`);
+    box.innerHTML = `<h1 class="solo-title">${esc(r.typeName)}の承認</h1>
+      <p class="muted small">${esc(info.approverName)} 様あての承認依頼です。</p>
+      <dl class="kv"><dt>申請番号</dt><dd>${esc(r.no)}</dd><dt>申請者</dt><dd>${esc(r.studentName)}${r.room ? '（' + esc(r.room) + '）' : ''}</dd><dt>申請日時</dt><dd>${esc(fmt(r.createdAt))}</dd>
+        ${r.fields.map(f => `<dt>${esc(f.label)}</dt><dd>${esc(fmtVal(f.kind, f.value))}</dd>`).join('')}</dl>
+      <h2 class="solo-sub">承認者の状況</h2>
+      <ul class="solo-steps">${r.steps.map(s => `<li><span>${esc(s.name)}${s.title ? '（' + esc(s.title) + '）' : ''}</span><span class="st st-${s.status === 'approved' ? 'approved' : s.status === 'pending' ? 'pending' : 'rejected'}">${STEP[s.status] || ''}</span></li>`).join('')}</ul>
+      <form id="f" class="decide">
+        <fieldset class="choice"><legend>あなたの回答</legend>
+          <label class="pick"><input type="radio" name="decision" value="ok"${pre === 'ok' ? ' checked' : ''}> 承認する</label>
+          <label class="pick"><input type="radio" name="decision" value="ng"${pre === 'ng' ? ' checked' : ''}> 承認しない</label></fieldset>
+        <label class="fld"><span>コメント（任意。承認しない場合は理由を書くと寮生に伝わります）</span><textarea name="comment" rows="3"></textarea></label>
+        <p class="err" id="err" role="alert"></p>
+        <button class="btn btn-primary btn-wide" type="submit">回答を確定する</button>
+        <p class="muted small">確定すると取り消せません。寮生とほかの承認者に結果が伝わります。</p>
+      </form>`;
+    document.getElementById('f').addEventListener('submit', async e => {
+      e.preventDefault();
+      const fd = new FormData(e.target); const btn = e.target.querySelector('button');
+      btn.disabled = true; btn.textContent = '送信中…'; document.getElementById('err').textContent = '';
+      try {
+        const out = await call('approve_decide', { t, decision: fd.get('decision'), comment: fd.get('comment') });
+        const rr = out.request;
+        const next = out.final === 'approved' ? '<p>全員の承認がそろったため、許可書を発行し、寮生と保護者にメールで知らせました。</p>'
+          : out.final === 'rejected' ? '<p>寮生とほかの承認者にメールで知らせました。</p>'
+          : '<p>ほかの承認者の回答を待っています。全員の承認がそろうとメールでお知らせします。</p>';
+        show(out.decision === 'ok' ? '承認しました' : '承認しないことを記録しました',
+          `<p>${esc(rr.studentName)}さんの${esc(rr.typeName)}（申請番号 ${esc(rr.no)}）について、あなたの回答を記録しました。</p>${next}<p class="actions"><a class="btn" href="${home}">承認者画面を開く（ログインが必要です）</a></p>`);
+      } catch (x) { document.getElementById('err').textContent = x.message; btn.disabled = false; btn.textContent = '回答を確定する'; }
+    });
+  }
+  if (!t) { show('このリンクは使えません', '<p>メールのボタンからもう一度開いてください。</p>'); return; }
+  call('approve_info', { t }).then(render).catch(e => show('読み込めませんでした', `<p class="err">${esc(e.message)}</p><p class="actions"><a class="btn" href="${esc(orig)}">読み込み直す</a></p>`));
+})();
+</script>
+</body>
+</html>
